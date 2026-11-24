@@ -30,7 +30,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 )
 
 const (
@@ -218,8 +217,14 @@ func RetryOnRateLimitInterceptor(maxRetry uint, maxBackoff time.Duration, backof
 				return err
 			}
 			lastErr = invoker(parentCtx, method, req, reply, cc, opts...)
-			rspStatus := getResultStatus(reply)
-			if retryOnRateLimit(parentCtx) && rspStatus.GetErrorCode() == commonpb.ErrorCode_RateLimit {
+			// Only retry when the call itself succeeded (gRPC OK) and the
+			// response carries a rate-limit status. A transport failure must be
+			// returned immediately: the reply object is reused across attempts,
+			// so a stale rate-limit status from an earlier attempt would
+			// otherwise be misread as a rate limit and the error swallowed by
+			// retrying a dead connection (nested inside the outer transport
+			// retry this could run thousands of attempts).
+			if lastErr == nil && retryOnRateLimit(parentCtx) && isRateLimitStatus(getResultStatus(reply)) {
 				continue
 			}
 			return lastErr
@@ -236,24 +241,38 @@ func retryOnRateLimit(ctx context.Context) bool {
 	return retry
 }
 
+// rateLimitModernCode is the modern Milvus error code for rate limit, shared
+// with the server-side merr partition table (legacy code 49 /
+// ErrorCode_RateLimit maps to modern code 8).
+const rateLimitModernCode int32 = 8
+
+// isRateLimitStatus reports whether the returned status is a Milvus rate-limit
+// error, matching the other SDKs which check both the legacy code
+// (ErrorCode_RateLimit) and the modern code (8).
+func isRateLimitStatus(s *commonpb.Status) bool {
+	if s == nil {
+		return false
+	}
+	return s.GetErrorCode() == commonpb.ErrorCode_RateLimit || s.GetCode() == rateLimitModernCode
+}
+
+// statusProvider matches the generated protobuf response types that embed a
+// *commonpb.Status. Nearly every Milvus response carries one, so a generic
+// assertion keeps the rate-limit retry working across all RPCs instead of a
+// hard-coded subset.
+type statusProvider interface {
+	GetStatus() *commonpb.Status
+}
+
 // getResultStatus returns status of response.
 func getResultStatus(reply interface{}) *commonpb.Status {
-	switch r := reply.(type) {
-	case *commonpb.Status:
+	if r, ok := reply.(*commonpb.Status); ok {
 		return r
-	case *milvuspb.MutationResult:
-		return r.GetStatus()
-	case *milvuspb.BoolResponse:
-		return r.GetStatus()
-	case *milvuspb.SearchResults:
-		return r.GetStatus()
-	case *milvuspb.QueryResults:
-		return r.GetStatus()
-	case *milvuspb.FlushResponse:
-		return r.GetStatus()
-	default:
-		return nil
 	}
+	if sp, ok := reply.(statusProvider); ok {
+		return sp.GetStatus()
+	}
+	return nil
 }
 
 func contextErrToGrpcErr(err error) error {

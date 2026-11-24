@@ -13,6 +13,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -24,6 +25,55 @@ const (
 )
 
 var regexValidScheme = regexp.MustCompile(`^https?:\/\/`)
+
+// Retry policy numbers shared with the pymilvus, C++ and Java SDKs. All three
+// baselines apply the same default profile: at most 75 attempts, an initial
+// 10ms backoff multiplied by 3 per attempt, capped at 3s, and no overall
+// timeout by default. Against a persistently failing server a call made with
+// context.Background() can therefore hold for roughly 3.5 minutes (sum of the
+// 75 backoffs) before surfacing the error; pass a context with a deadline
+// (e.g. context.WithTimeout) to bound the whole retry window.
+const (
+	defaultRetryTimes          = 75
+	defaultRetryInitialBackoff = 10 * time.Millisecond
+	defaultRetryMaxBackoff     = 3 * time.Second
+	defaultRetryMultiplier     = 3
+)
+
+// retryableCodes lists the gRPC status codes the transport-level retry
+// interceptor retries on. It mirrors the shared retry policy of the pymilvus,
+// C++ and Java SDKs, which retry every code except DEADLINE_EXCEEDED,
+// PERMISSION_DENIED, UNAUTHENTICATED, INVALID_ARGUMENT, ALREADY_EXISTS,
+// RESOURCE_EXHAUSTED and UNIMPLEMENTED. The retry middleware never retries
+// context errors (Canceled / DeadlineExceeded) regardless of this list, and the
+// Milvus application-level rate limit is retried by the dedicated rate-limit
+// interceptor rather than through the gRPC RESOURCE_EXHAUSTED status code.
+var retryableCodes = []codes.Code{
+	codes.Canceled,
+	codes.Unknown,
+	codes.NotFound,
+	codes.FailedPrecondition,
+	codes.Aborted,
+	codes.OutOfRange,
+	codes.Internal,
+	codes.Unavailable,
+	codes.DataLoss,
+}
+
+// retryBackoff returns the exponential backoff for the given retry attempt,
+// aligned with the other SDKs: initialBackoff * multiplier^attempt, capped at
+// maxBackoff. The capped loop avoids the duration overflow a raw power
+// computation would hit for large attempts.
+func retryBackoff(attempt uint, maxBackoff time.Duration) time.Duration {
+	wait := defaultRetryInitialBackoff
+	for i := uint(1); i < attempt && wait < maxBackoff; i++ {
+		wait *= defaultRetryMultiplier
+	}
+	if wait > maxBackoff {
+		return maxBackoff
+	}
+	return wait
+}
 
 // DefaultGrpcOpts is GRPC options for milvus client.
 var DefaultGrpcOpts = []grpc.DialOption{
@@ -128,14 +178,15 @@ func (c *ClientConfig) getRetryOnRateLimitInterceptor() grpc.UnaryClientIntercep
 	}
 
 	return RetryOnRateLimitInterceptor(c.RetryRateLimit.MaxRetry, c.RetryRateLimit.MaxBackoff, func(ctx context.Context, attempt uint) time.Duration {
-		return 10 * time.Millisecond * time.Duration(math.Pow(3, float64(attempt)))
+		// honor a caller-configured MaxBackoff above or below the parity 3s cap
+		return retryBackoff(attempt, c.RetryRateLimit.MaxBackoff)
 	})
 }
 
 func (c *ClientConfig) defaultRetryRateLimitOption() *RetryRateLimitOption {
 	return &RetryRateLimitOption{
-		MaxRetry:   75,
-		MaxBackoff: 3 * time.Second,
+		MaxRetry:   defaultRetryTimes,
+		MaxBackoff: defaultRetryMaxBackoff,
 	}
 }
 
